@@ -43,6 +43,7 @@ class OpsExecuter : public seastar::enable_lw_shared_from_this<OpsExecuter> {
     crimson::ct_error::eexist,
     crimson::ct_error::enospc,
     crimson::ct_error::edquot,
+    crimson::ct_error::cmp_fail,
     crimson::ct_error::eagain,
     crimson::ct_error::invarg,
     crimson::ct_error::erange,
@@ -231,8 +232,13 @@ private:
     return do_const_op(std::forward<Func>(f));
   }
 
+  enum class modified_by {
+    user,
+    sys,
+  };
+
   template <class Func>
-  auto do_write_op(Func&& f, bool um);
+  auto do_write_op(Func&& f, modified_by m = modified_by::user);
 
   decltype(auto) dont_do_legacy_op() {
     return crimson::ct_error::operation_not_supported::make();

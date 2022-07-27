@@ -26,15 +26,23 @@ enum class journal_type_t {
 class Journal {
 public:
   /**
+   * initializes journal for mkfs writes -- must run prior to calls
+   * to submit_record.
+   */
+  using open_for_mkfs_ertr = crimson::errorator<
+    crimson::ct_error::input_output_error
+    >;
+  using open_for_mkfs_ret = open_for_mkfs_ertr::future<journal_seq_t>;
+  virtual open_for_mkfs_ret open_for_mkfs() = 0;
+
+  /**
    * initializes journal for new writes -- must run prior to calls
    * to submit_record.  Should be called after replay if not a new
    * Journal.
    */
-  using open_for_write_ertr = crimson::errorator<
-    crimson::ct_error::input_output_error
-    >;
-  using open_for_write_ret = open_for_write_ertr::future<journal_seq_t>;
-  virtual open_for_write_ret open_for_write() = 0;
+  using open_for_mount_ertr = open_for_mkfs_ertr;
+  using open_for_mount_ret = open_for_mkfs_ret;
+  virtual open_for_mount_ret open_for_mount() = 0;
 
   /// close journal
   using close_ertr = crimson::errorator<
@@ -85,9 +93,9 @@ public:
   using delta_handler_t = std::function<
     replay_ret(const record_locator_t&,
 	       const delta_info_t&,
-	       const journal_seq_t, // journal seq from which
-				    // alloc delta should replayed
-	       seastar::lowres_system_clock::time_point last_modified)>;
+	       const journal_seq_t&, // dirty_tail
+	       const journal_seq_t&, // alloc_tail
+	       sea_time_point modify_time)>;
   virtual replay_ret replay(
     delta_handler_t &&delta_handler) = 0;
 

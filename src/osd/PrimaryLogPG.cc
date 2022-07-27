@@ -1038,7 +1038,14 @@ void PrimaryLogPG::do_command(
 
     f->close_section();
   }
-
+  else if (prefix == "log") {
+    
+    f->open_object_section("op_log");
+    f->open_object_section("pg_log_t");
+    recovery_state.get_pg_log().get_log().dump(f.get());
+    f->close_section();
+    f->close_section();
+  }
   else if (prefix == "mark_unfound_lost") {
     string mulcmd;
     cmd_getval(cmdmap, "mulcmd", mulcmd);
@@ -1796,7 +1803,6 @@ void PrimaryLogPG::do_request(
     op->pg_trace.event("do request");
   }
 
-  [[maybe_unused]] auto span = tracing::osd::tracer.add_span(__func__, op->osd_parent_span);
 
 // make sure we have a new enough map
   auto p = waiting_for_map.find(op->get_source());
@@ -2169,7 +2175,6 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 	   << " flags " << ceph_osd_flag_string(m->get_flags())
 	   << dendl;
 
-  [[maybe_unused]] auto span = tracing::osd::tracer.add_span(__func__, op->osd_parent_span);
 
   // missing object?
   if (is_unreadable_object(head)) {
@@ -4188,7 +4193,6 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
         reqid.name._num, reqid.tid, reqid.inc);
   }
 
-  [[maybe_unused]] auto span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
 
   int result = prepare_transaction(ctx);
 
@@ -5966,10 +5970,6 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
   dout(10) << "do_osd_op " << soid << " " << ops << dendl;
 
-  jspan span;
-  if (ctx->op) {
-    span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
-  }
   ctx->current_osd_subop_num = 0;
   for (auto p = ops.begin(); p != ops.end(); ++p, ctx->current_osd_subop_num++, ctx->processed_subop_count++) {
     OSDOp& osd_op = *p;
@@ -7113,7 +7113,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  goto fail;
 	}
 	pg_t raw_pg;
-	get_osdmap()->object_locator_to_pg(target_name, target_oloc, raw_pg);
+	result = get_osdmap()->object_locator_to_pg(target_name, target_oloc, raw_pg);
+	if (result < 0) {
+	  dout(5) << " pool information is invalid: " << result << dendl;
+	  break;
+	}
 	hobject_t target(target_name, target_oloc.key, target_snapid,
 		raw_pg.ps(), raw_pg.pool(),
 		target_oloc.nspace);
@@ -7262,7 +7266,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
 	pg_t raw_pg;
 	chunk_info_t chunk_info;
-	get_osdmap()->object_locator_to_pg(tgt_name, tgt_oloc, raw_pg);
+	result = get_osdmap()->object_locator_to_pg(tgt_name, tgt_oloc, raw_pg);
+	if (result < 0) {
+	  dout(5) << " pool information is invalid: " << result << dendl;
+	  break;
+	}
 	hobject_t target(tgt_name, tgt_oloc.key, snapid_t(),
 			 raw_pg.ps(), raw_pg.pool(),
 			 tgt_oloc.nspace);
@@ -8492,7 +8500,7 @@ void PrimaryLogPG::_do_rollback_to(OpContext *ctx, ObjectContextRef rollback_to,
 void PrimaryLogPG::_make_clone(
   OpContext *ctx,
   PGTransaction* t,
-  ObjectContextRef obc,
+  ObjectContextRef clone_obc,
   const hobject_t& head, const hobject_t& coid,
   object_info_t *poi)
 {
@@ -8500,8 +8508,8 @@ void PrimaryLogPG::_make_clone(
   encode(*poi, bv, get_osdmap()->get_features(CEPH_ENTITY_TYPE_OSD, nullptr));
 
   t->clone(coid, head);
-  setattr_maybe_cache(obc, t, OI_ATTR, bv);
-  rmattr_maybe_cache(obc, t, SS_ATTR);
+  setattr_maybe_cache(clone_obc, t, OI_ATTR, bv);
+  rmattr_maybe_cache(clone_obc, t, SS_ATTR);
 }
 
 void PrimaryLogPG::make_writeable(OpContext *ctx)
@@ -8562,14 +8570,12 @@ void PrimaryLogPG::make_writeable(OpContext *ctx)
     hobject_t coid = soid;
     coid.snap = snapc.seq;
 
-    unsigned l;
-    for (l = 1;
-	 l < snapc.snaps.size() && snapc.snaps[l] > ctx->new_snapset.seq;
-	 l++) ;
-
-    vector<snapid_t> snaps(l);
-    for (unsigned i=0; i<l; i++)
-      snaps[i] = snapc.snaps[i];
+    const auto snaps = [&] {
+      auto last = find_if_not(
+        begin(snapc.snaps), end(snapc.snaps),
+        [&](snapid_t snap_id) { return snap_id > ctx->new_snapset.seq; });
+      return vector<snapid_t>{begin(snapc.snaps), last};
+    }();
 
     // prepare clone
     object_info_t static_snap_oi(coid);
@@ -8633,8 +8639,9 @@ void PrimaryLogPG::make_writeable(OpContext *ctx)
     // clone_overlap should contain an entry for each clone
     // (an empty interval_set if there is no overlap)
     ctx->new_snapset.clone_overlap[coid.snap];
-    if (ctx->obs->oi.size)
+    if (ctx->obs->oi.size) {
       ctx->new_snapset.clone_overlap[coid.snap].insert(0, ctx->obs->oi.size);
+    }
 
     // log clone
     dout(10) << " cloning v " << ctx->obs->oi.version
@@ -8924,10 +8931,6 @@ void PrimaryLogPG::finish_ctx(OpContext *ctx, int log_op_type, int result)
 	   << dendl;
   utime_t now = ceph_clock_now();
 
-  jspan span;
-  if (ctx->op) {
-    span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
-  }
 
   // Drop the reference if deduped chunk is modified
   if (ctx->new_obs.oi.is_dirty() &&
@@ -10588,7 +10591,10 @@ int PrimaryLogPG::do_cdc(const object_info_t& oi,
   for (auto p : cdc_chunks) {
     bufferlist chunk;
     chunk.substr_of(bl, p.first, p.second);
-    hobject_t target = get_fpoid_from_chunk(oi.soid, chunk);
+    auto [ret, target] = get_fpoid_from_chunk(oi.soid, chunk);
+    if (ret < 0) {
+      return ret;
+    }
     chunks[p.first] = std::move(chunk);
     chunk_map[p.first] = chunk_info_t(0, p.second, target);
     total_length += p.second;
@@ -10596,11 +10602,12 @@ int PrimaryLogPG::do_cdc(const object_info_t& oi,
   return total_length;
 }
 
-hobject_t PrimaryLogPG::get_fpoid_from_chunk(const hobject_t soid, bufferlist& chunk)
+std::pair<int, hobject_t> PrimaryLogPG::get_fpoid_from_chunk(
+  const hobject_t soid, bufferlist& chunk)
 {
   pg_pool_t::fingerprint_t fp_algo = pool.info.get_fingerprint_type();
   if (fp_algo == pg_pool_t::TYPE_FINGERPRINT_NONE) {
-    return hobject_t();
+    return make_pair(-EINVAL, hobject_t());
   }
   object_t fp_oid = [&fp_algo, &chunk]() -> string {
     switch (fp_algo) {
@@ -10621,11 +10628,14 @@ hobject_t PrimaryLogPG::get_fpoid_from_chunk(const hobject_t soid, bufferlist& c
   oloc.pool = pool.info.get_dedup_tier();
   // check if dedup_tier isn't set
   ceph_assert(oloc.pool > 0);
-  get_osdmap()->object_locator_to_pg(fp_oid, oloc, raw_pg);
+  int ret = get_osdmap()->object_locator_to_pg(fp_oid, oloc, raw_pg);
+  if (ret < 0) {
+    return make_pair(ret, hobject_t());
+  }
   hobject_t target(fp_oid, oloc.key, snapid_t(),
 		    raw_pg.ps(), raw_pg.pool(),
 		    oloc.nspace);
-  return target;
+  return make_pair(0, target);
 }
 
 int PrimaryLogPG::finish_set_dedup(hobject_t oid, int r, ceph_tid_t tid, uint64_t offset)
@@ -11314,10 +11324,6 @@ void PrimaryLogPG::op_applied(const eversion_t &applied_version)
 
 void PrimaryLogPG::eval_repop(RepGather *repop)
 {
-  jspan span;
-  if (repop->op) {
-    span = tracing::osd::tracer.add_span(__func__, repop->op->osd_parent_span);
-  }
   dout(10) << "eval_repop " << *repop
     << (repop->op && repop->op->get_req<MOSDOp>() ? "" : " (no op)") << dendl;
 
@@ -11373,10 +11379,6 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
           << " o " << soid
           << dendl;
 
-  jspan span;
-  if (ctx->op) {
-    span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
-  }
 
   repop->v = ctx->at_version;
 

@@ -26,6 +26,8 @@
 #include "crimson/osd/pg_interval_interrupt_condition.h"
 #include "crimson/osd/ops_executer.h"
 #include "crimson/osd/osd_operations/client_request.h"
+#include "crimson/osd/osd_operations/logmissing_request.h"
+#include "crimson/osd/osd_operations/logmissing_request_reply.h"
 #include "crimson/osd/osd_operations/peering_event.h"
 #include "crimson/osd/osd_operations/replicated_request.h"
 #include "crimson/osd/osd_operations/background_recovery.h"
@@ -201,7 +203,6 @@ public:
   void start_peering_event_operation(T &&evt, float delay = 0) {
     (void) shard_services.start_operation<LocalPeeringEvent>(
       this,
-      shard_services,
       pg_whoami,
       pgid,
       delay,
@@ -220,7 +221,7 @@ public:
     unsigned priority,
     PGPeeringEventURef on_grant,
     PGPeeringEventURef on_preempt) final {
-    shard_services.local_reserver.request_reservation(
+    shard_services.local_request_reservation(
       pgid,
       on_grant ? make_lambda_context([this, on_grant=std::move(on_grant)] (int) {
 	start_peering_event_operation(std::move(*on_grant));
@@ -234,13 +235,13 @@ public:
 
   void update_local_background_io_priority(
     unsigned priority) final {
-    shard_services.local_reserver.update_priority(
+    shard_services.local_update_priority(
       pgid,
       priority);
   }
 
   void cancel_local_background_io_reservation() final {
-    shard_services.local_reserver.cancel_reservation(
+    shard_services.local_cancel_reservation(
       pgid);
   }
 
@@ -248,7 +249,7 @@ public:
     unsigned priority,
     PGPeeringEventURef on_grant,
     PGPeeringEventURef on_preempt) final {
-    shard_services.remote_reserver.request_reservation(
+    shard_services.remote_request_reservation(
       pgid,
       on_grant ? make_lambda_context([this, on_grant=std::move(on_grant)] (int) {
 	start_peering_event_operation(std::move(*on_grant));
@@ -261,7 +262,7 @@ public:
   }
 
   void cancel_remote_recovery_reservation() final {
-    shard_services.remote_reserver.cancel_reservation(
+    shard_services.remote_cancel_reservation(
       pgid);
   }
 
@@ -431,7 +432,7 @@ public:
     return OstreamTemp(CLOG_ERROR, nullptr);
   }
 
-  ceph::signedspan get_mnow() final;
+  ceph::signedspan get_mnow() const final;
   HeartbeatStampsRef get_hb_stamps(int peer) final;
   void schedule_renew_lease(epoch_t plr, ceph::timespan delay) final;
 
@@ -542,9 +543,20 @@ public:
   interruptible_future<> handle_rep_op(Ref<MOSDRepOp> m);
   void handle_rep_op_reply(crimson::net::ConnectionRef conn,
 			   const MOSDRepOpReply& m);
+  interruptible_future<> do_update_log_missing(Ref<MOSDPGUpdateLogMissing> m);
+  interruptible_future<> do_update_log_missing_reply(
+                         Ref<MOSDPGUpdateLogMissingReply> m);
+
 
   void print(std::ostream& os) const;
   void dump_primary(Formatter*);
+  seastar::future<> submit_error_log(
+    Ref<MOSDOp> m,
+    const OpInfo &op_info,
+    ObjectContextRef obc,
+    const std::error_code e,
+    ceph_tid_t rep_tid,
+    eversion_t &version);
 
 private:
   template<RWState::State State>
@@ -732,6 +744,8 @@ private:
   template <class T>
   friend class PeeringEvent;
   friend class RepRequest;
+  friend class LogMissingRequest;
+  friend class LogMissingRequestReply;
   friend class BackfillRecovery;
   friend struct PGFacade;
   friend class InternalClientRequest;
@@ -761,6 +775,11 @@ private:
   BackfillRecovery::BackfillRecoveryPipeline backfill_pipeline;
 
   friend class IOInterruptCondition;
+  struct log_update_t {
+    std::set<pg_shard_t> waiting_on;
+    seastar::shared_promise<> all_committed;
+  };
+  std::map<ceph_tid_t, log_update_t> log_entry_update_waiting_on;
 };
 
 struct PG::do_osd_ops_params_t {

@@ -3711,6 +3711,7 @@ void Monitor::handle_command(MonOpRequestRef op)
     mdsmon()->dump_info(f.get());
     authmon()->dump_info(f.get());
     mgrstatmon()->dump_info(f.get());
+    logmon()->dump_info(f.get());
 
     paxos->dump_info(f.get());
 
@@ -6588,7 +6589,7 @@ void Monitor::notify_new_monmap(bool can_change_external_state)
   dout(30) << __func__ << "we have " << monmap->removed_ranks.size() << " removed ranks" << dendl;
   for (auto i = monmap->removed_ranks.rbegin();
        i != monmap->removed_ranks.rend(); ++i) {
-    int rank = *i;
+    unsigned rank = *i;
     dout(10) << __func__ << "removing rank " << rank << dendl;
     elector.notify_rank_removed(rank);
   }

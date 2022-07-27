@@ -1,6 +1,8 @@
 import errno
+import ipaddress
 import logging
 import os
+import socket
 from typing import List, Any, Tuple, Dict, Optional, cast
 from urllib.parse import urlparse
 
@@ -37,10 +39,9 @@ class GrafanaService(CephadmService):
 
             deps.append(dd.name())
 
-        daemons = self.mgr.cache.get_daemons_by_service('mgr')
+        daemons = self.mgr.cache.get_daemons_by_service('loki')
         loki_host = ''
-        assert daemons is not None
-        if daemons != []:
+        if daemons:
             assert daemons[0].hostname is not None
             addr = daemons[0].ip if daemons[0].ip else self._inventory_get_fqdn(daemons[0].hostname)
             loki_host = build_url(scheme='http', host=addr, port=3100)
@@ -148,8 +149,19 @@ class AlertmanagerService(CephadmService):
         proto = None  # http: or https:
         url = mgr_map.get('services', {}).get('dashboard', None)
         if url:
-            dashboard_urls.append(url.rstrip('/'))
-            p_result = urlparse(url)
+            p_result = urlparse(url.rstrip('/'))
+            hostname = socket.getfqdn(p_result.hostname)
+
+            try:
+                ip = ipaddress.ip_address(hostname)
+            except ValueError:
+                pass
+            else:
+                if ip.version == 6:
+                    hostname = f'[{hostname}]'
+
+            dashboard_urls.append(
+                f'{p_result.scheme}://{hostname}:{p_result.port}{p_result.path}')
             proto = p_result.scheme
             port = p_result.port
         # scan all mgrs to generate deps and to get standbys too.
@@ -432,14 +444,14 @@ class PromtailService(CephadmService):
     def generate_config(self, daemon_spec: CephadmDaemonDeploySpec) -> Tuple[Dict[str, Any], List[str]]:
         assert self.TYPE == daemon_spec.daemon_type
         deps: List[str] = []
-        hostnames: List[str] = []
-        for dd in self.mgr.cache.get_daemons_by_service('mgr'):
-            assert dd.hostname is not None
-            addr = self.mgr.inventory.get_addr(dd.hostname)
-            hostnames.append(addr)
+        daemons = self.mgr.cache.get_daemons_by_service('loki')
+        loki_host = ''
+        if daemons:
+            assert daemons[0].hostname is not None
+            loki_host = daemons[0].ip or self._inventory_get_fqdn(daemons[0].hostname)
+
         context = {
-            'hostnames': hostnames,
-            'client_hostname': hostnames[0],
+            'client_hostname': loki_host,
         }
 
         yml = self.mgr.template.render('services/promtail.yml.j2', context)

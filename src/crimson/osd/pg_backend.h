@@ -99,7 +99,8 @@ public:
     const ObjectState& os,
     OSDOp& osd_op);
   using cmp_ext_errorator = ll_read_errorator::extend<
-    crimson::ct_error::invarg>;
+    crimson::ct_error::invarg,
+    crimson::ct_error::cmp_fail>;
   using cmp_ext_ierrorator =
     ::crimson::interruptible::interruptible_errorator<
       ::crimson::osd::IOInterruptCondition,
@@ -150,6 +151,11 @@ public:
   interruptible_future<> remove(
     ObjectState& os,
     ceph::os::Transaction& txn);
+  interruptible_future<> set_allochint(
+    ObjectState& os,
+    const OSDOp& osd_op,
+    ceph::os::Transaction& trans,
+    object_stat_sum_t& delta_stats);
   write_iertr::future<> write(
     ObjectState& os,
     const OSDOp& osd_op,

@@ -445,7 +445,8 @@ class ServiceSpec(object):
     """
     KNOWN_SERVICE_TYPES = 'alertmanager crash grafana iscsi loki promtail mds mgr mon nfs ' \
                           'node-exporter osd prometheus rbd-mirror rgw agent ' \
-                          'container ingress cephfs-mirror snmp-gateway'.split()
+                          'container ingress cephfs-mirror snmp-gateway jaeger-tracing ' \
+                          'elasticsearch jaeger-agent jaeger-collector jaeger-query'.split()
     REQUIRES_SERVICE_ID = 'iscsi mds nfs rgw container ingress '.split()
     MANAGED_CONFIG_OPTIONS = [
         'mds_join_fs',
@@ -470,6 +471,11 @@ class ServiceSpec(object):
             'loki': MonitoringSpec,
             'promtail': MonitoringSpec,
             'snmp-gateway': SNMPGatewaySpec,
+            'elasticsearch': TracingSpec,
+            'jaeger-agent': TracingSpec,
+            'jaeger-collector': TracingSpec,
+            'jaeger-query': TracingSpec,
+            'jaeger-tracing': TracingSpec,
         }.get(service_type, cls)
         if ret == ServiceSpec and not service_type:
             raise SpecValidationError('Spec needs a "service_type" key.')
@@ -1355,3 +1361,116 @@ class MDSSpec(ServiceSpec):
 
 
 yaml.add_representer(MDSSpec, ServiceSpec.yaml_representer)
+
+
+class TracingSpec(ServiceSpec):
+    SERVICE_TYPES = ['elasticsearch', 'jaeger-collector', 'jaeger-query', 'jaeger-agent']
+
+    def __init__(self,
+                 service_type: str,
+                 es_nodes: Optional[str] = None,
+                 without_query: bool = False,
+                 service_id: Optional[str] = None,
+                 config: Optional[Dict[str, str]] = None,
+                 networks: Optional[List[str]] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False
+                 ):
+        assert service_type in TracingSpec.SERVICE_TYPES + ['jaeger-tracing']
+
+        super(TracingSpec, self).__init__(
+            service_type, service_id,
+            placement=placement, unmanaged=unmanaged,
+            preview_only=preview_only, config=config,
+            networks=networks)
+        self.without_query = without_query
+        self.es_nodes = es_nodes
+
+    def get_port_start(self) -> List[int]:
+        return [self.get_port()]
+
+    def get_port(self) -> int:
+        return {'elasticsearch': 9200,
+                'jaeger-agent': 6799,
+                'jaeger-collector': 14250,
+                'jaeger-query': 16686}[self.service_type]
+
+    def get_tracing_specs(self) -> List[ServiceSpec]:
+        assert self.service_type == 'jaeger-tracing'
+        specs: List[ServiceSpec] = []
+        daemons: Dict[str, Optional[PlacementSpec]] = {
+            daemon: None for daemon in TracingSpec.SERVICE_TYPES}
+
+        if self.es_nodes:
+            del daemons['elasticsearch']
+        if self.without_query:
+            del daemons['jaeger-query']
+        if self.placement:
+            daemons.update({'jaeger-collector': self.placement})
+
+        for daemon, daemon_placement in daemons.items():
+            specs.append(TracingSpec(service_type=daemon,
+                                     es_nodes=self.es_nodes,
+                                     placement=daemon_placement,
+                                     unmanaged=self.unmanaged,
+                                     config=self.config,
+                                     networks=self.networks,
+                                     preview_only=self.preview_only
+                                     ))
+        return specs
+
+
+yaml.add_representer(TracingSpec, ServiceSpec.yaml_representer)
+
+
+class TunedProfileSpec():
+    def __init__(self,
+                 profile_name: str,
+                 placement: Optional[PlacementSpec] = None,
+                 settings: Optional[Dict[str, str]] = None,
+                 ):
+        self.profile_name = profile_name
+        self.placement = placement or PlacementSpec(host_pattern='*')
+        self.settings = settings or {}
+        self._last_updated: str = ''
+
+    @classmethod
+    def from_json(cls, spec: Dict[str, Any]) -> 'TunedProfileSpec':
+        data = {}
+        if 'profile_name' not in spec:
+            raise SpecValidationError('Tuned profile spec must include "profile_name" field')
+        data['profile_name'] = spec['profile_name']
+        if not isinstance(data['profile_name'], str):
+            raise SpecValidationError('"profile_name" field must be a string')
+        if 'placement' in spec:
+            data['placement'] = PlacementSpec.from_json(spec['placement'])
+        if 'settings' in spec:
+            data['settings'] = spec['settings']
+        return cls(**data)
+
+    def to_json(self) -> Dict[str, Any]:
+        res: Dict[str, Any] = {}
+        res['profile_name'] = self.profile_name
+        res['placement'] = self.placement.to_json()
+        res['settings'] = self.settings
+        return res
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, TunedProfileSpec):
+            if (
+                self.placement == other.placement
+                and self.profile_name == other.profile_name
+                and self.settings == other.settings
+            ):
+                return True
+            return False
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f'TunedProfile({self.profile_name})'
+
+    def copy(self) -> 'TunedProfileSpec':
+        # for making deep copies so you can edit the settings in one without affecting the other
+        # mostly for testing purposes
+        return TunedProfileSpec(self.profile_name, self.placement, self.settings.copy())

@@ -28,7 +28,9 @@ class ShardServices;
 class ClientRequest final : public PhasedOperationT<ClientRequest>,
                             private CommonClientRequest {
   OSD &osd;
-  crimson::net::ConnectionRef conn;
+  const crimson::net::ConnectionRef conn;
+  // must be after conn due to ConnectionPipeline's life-time
+  PipelineHandle handle;
   Ref<MOSDOp> m;
   OpInfo op_info;
   seastar::promise<> on_complete;
@@ -47,6 +49,7 @@ public:
     } send_reply;
     friend class ClientRequest;
     friend class LttngBackend;
+    friend class HistoricBackend;
   };
 
   using ordering_hook_t = boost::intrusive::list_member_hook<>;
@@ -154,6 +157,16 @@ public:
 
   friend class LttngBackend;
   friend class HistoricBackend;
+
+  auto get_started() const {
+    return get_event<StartEvent>().get_timestamp();
+  };
+
+  auto get_completed() const {
+    return get_event<CompletionEvent>().get_timestamp();
+  };
+
+  void put_historic() const;
 };
 
 }
